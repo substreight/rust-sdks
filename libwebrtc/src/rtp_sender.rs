@@ -56,6 +56,20 @@ impl VideoEncoderBackend {
     }
 }
 
+/// How the encoder trades off resolution vs framerate under constraint.
+/// Maps to `webrtc::DegradationPreference` on the sender's RtpParameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradationPreference {
+    /// Don't degrade automatically.
+    Disabled,
+    /// Hold framerate; lower resolution under constraint (games/motion).
+    MaintainFramerate,
+    /// Hold resolution; lower framerate under constraint (text/detail).
+    MaintainResolution,
+    /// Degrade a balance of both.
+    Balanced,
+}
+
 #[derive(Clone)]
 pub struct RtpSender {
     pub(crate) handle: imp_rs::RtpSender,
@@ -88,6 +102,13 @@ impl RtpSender {
     /// compatible encoder.
     pub fn set_video_encoder_backend(&self, backend: VideoEncoderBackend) {
         self.handle.set_video_encoder_backend(backend)
+    }
+
+    /// Sets the degradation preference on this sender's RtpParameters.
+    /// `MaintainFramerate` is the right choice for screen-shared games:
+    /// under encoder/bandwidth constraint resolution gives, not framerate.
+    pub fn set_degradation_preference(&self, preference: DegradationPreference) {
+        self.handle.set_degradation_preference(preference)
     }
 }
 

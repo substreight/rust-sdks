@@ -19,6 +19,10 @@ use crate::prelude::*;
 
 /// Preferred backend for video encoding when publishing a video track.
 pub use libwebrtc::rtp_sender::VideoEncoderBackend;
+/// Resolution-vs-framerate tradeoff under encoder/bandwidth constraint.
+pub use libwebrtc::rtp_sender::DegradationPreference;
+/// Content hint for published video tracks ('motion' vs 'detail').
+pub use libwebrtc::video_track::ContentHint;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -131,6 +135,10 @@ pub struct TrackPublishOptions {
     /// encoding is produced and that mode is forwarded to libwebrtc to
     /// enable true SVC for VP9/AV1. Has no effect for VP8/H264.
     pub scalability_mode: Option<String>,
+    /// Degradation preference applied to the sender. `MaintainFramerate`
+    /// suits motion content (games); the libwebrtc default for screenshare
+    /// sources is maintain-resolution, which drops frames under load.
+    pub degradation_preference: Option<DegradationPreference>,
 }
 
 impl Default for TrackPublishOptions {
@@ -149,6 +157,7 @@ impl Default for TrackPublishOptions {
             packet_trailer_features: PacketTrailerFeatures::default(),
             video_encoder: VideoEncoderBackend::Auto,
             scalability_mode: None,
+            degradation_preference: None,
         }
     }
 }

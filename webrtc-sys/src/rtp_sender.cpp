@@ -209,4 +209,25 @@ void RtpSender::set_video_encoder_backend(VideoEncoderBackend backend) const {
       std::make_unique<FixedVideoEncoderSelector>(backend));
 }
 
+void RtpSender::set_degradation_preference(
+    DegradationPreference preference) const {
+  if (sender_->media_type() != webrtc::MediaType::VIDEO) {
+    RTC_LOG(LS_WARNING)
+        << "Ignoring degradation preference on non-video sender.";
+    return;
+  }
+
+  // Mutate natively: the Rust-side RtpParameters round-trip is lossy
+  // (drops encodings/transaction_id), so GetParameters/SetParameters must
+  // stay on this side of the FFI.
+  auto params = sender_->GetParameters();
+  params.degradation_preference =
+      static_cast<webrtc::DegradationPreference>(preference);
+  auto error = sender_->SetParameters(params);
+  if (!error.ok()) {
+    RTC_LOG(LS_WARNING) << "set_degradation_preference failed: "
+                        << error.message();
+  }
+}
+
 }  // namespace livekit_ffi

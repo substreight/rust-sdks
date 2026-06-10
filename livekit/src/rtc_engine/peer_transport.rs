@@ -308,7 +308,7 @@ impl PeerTransport {
         let lines: Vec<&str> =
             if uses_crlf { sdp.split("\r\n").collect() } else { sdp.split('\n').collect() };
 
-        // 1) Find VP9/AV1 payload types
+        // 1) Find VP9/AV1/H264 payload types
         let mut target_pts: Vec<&str> = Vec::new();
         for line in &lines {
             let l = line.trim();
@@ -316,7 +316,9 @@ impl PeerTransport {
                 let mut it = rest.split_whitespace();
                 let pt = it.next().unwrap_or("");
                 let codec = it.next().unwrap_or("");
-                if (codec.starts_with("VP9/90000") || codec.starts_with("AV1/90000"))
+                if (codec.starts_with("VP9/90000")
+                    || codec.starts_with("AV1/90000")
+                    || codec.starts_with("H264/90000"))
                     && !pt.is_empty()
                 {
                     target_pts.push(pt);
@@ -428,7 +430,8 @@ impl PeerTransport {
 
         let is_vp9 = sdp.contains(" VP9/90000");
         let is_av1 = sdp.contains(" AV1/90000");
-        if is_vp9 || is_av1 {
+        let is_h264 = sdp.contains(" H264/90000");
+        if is_vp9 || is_av1 || is_h264 {
             if let Some(start_kbps) = Self::compute_start_bitrate_kbps(inner.max_send_bitrate_bps) {
                 log::info!(
                     "Applying x-google-start-bitrate={} kbps (ultimate_bps={:?})",
@@ -438,7 +441,7 @@ impl PeerTransport {
 
                 let munged = Self::munge_x_google_start_bitrate(&sdp, start_kbps);
                 if munged != sdp {
-                    log::info!("SDP munged successfully (VP9/AV1)");
+                    log::info!("SDP munged successfully (VP9/AV1/H264)");
                     match SessionDescription::parse(&munged, offer.sdp_type()) {
                         Ok(parsed) => offer = parsed,
                         Err(e) => log::warn!(

@@ -152,6 +152,13 @@ fn main() {
             //println!("cargo:rustc-link-lib=dylib=va");
             //println!("cargo:rustc-link-lib=dylib=va_win32");
 
+            // Hardware H264 encoding via Media Foundation hardware MFTs
+            // (NVENC / AMD AMF / Intel QuickSync).
+            println!("cargo:rustc-link-lib=dylib=mfplat");
+            println!("cargo:rustc-link-lib=dylib=mfuuid");
+            println!("cargo:rustc-link-lib=dylib=mf");
+            println!("cargo:rustc-link-lib=dylib=mfreadwrite");
+
             builder
                 //.include("./vaapi-windows/DirectX-Headers-1.0/include")
                 //.include(path::PathBuf::from("./vaapi-windows/x64/include"))
@@ -160,6 +167,9 @@ fn main() {
                 //.file("src/vaapi/vaapi_h264_encoder_wrapper.cpp")
                 //.file("src/vaapi/vaapi_encoder_factory.cpp")
                 //.file("src/vaapi/h264_encoder_impl.cpp")
+                .file("src/mf/mf_encoder_factory.cpp")
+                .file("src/mf/mf_h264_encoder_impl.cpp")
+                .flag("-DUSE_MF_VIDEO_CODEC=1")
                 .flag("/std:c++20")
                 //.flag("/wd4819")
                 //.flag("/wd4068")

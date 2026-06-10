@@ -22,6 +22,18 @@ use crate::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::native::packet_trailer::PacketTrailerHandler;
 
+/// Content hint for a video track, mirroring
+/// `webrtc::VideoTrackInterface::ContentHint`. Influences encoder
+/// degradation behavior: `Fluid` (motion) favors framerate, `Detailed`
+/// and `Text` favor resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentHint {
+    None,
+    Fluid,
+    Detailed,
+    Text,
+}
+
 #[derive(Clone)]
 pub struct RtcVideoTrack {
     pub(crate) handle: imp_vt::RtcVideoTrack,
@@ -29,6 +41,12 @@ pub struct RtcVideoTrack {
 
 impl RtcVideoTrack {
     media_stream_track!();
+
+    /// Set the content hint for this track ('motion' vs 'detail' tradeoff).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_content_hint(&self, hint: ContentHint) {
+        self.handle.set_content_hint(hint);
+    }
 
     /// Set the packet trailer handler for this track.
     ///

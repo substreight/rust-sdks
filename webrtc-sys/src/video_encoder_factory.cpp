@@ -50,6 +50,10 @@
 #include "vaapi/vaapi_encoder_factory.h"
 #endif
 
+#if defined(USE_MF_VIDEO_CODEC)
+#include "mf/mf_encoder_factory.h"
+#endif
+
 namespace livekit_ffi {
 
 namespace {
@@ -164,6 +168,23 @@ void AddVaapiFactory(
 #endif
 }
 
+// Windows: hardware H264 via Media Foundation (NVENC/AMF/QSV MFTs).
+// Registered under the generic Hardware backend like Android.
+void AddMediaFoundationFactory(
+    std::vector<VideoEncoderBackendFactory>& factories) {
+#if defined(USE_MF_VIDEO_CODEC)
+  if (webrtc::MediaFoundationVideoEncoderFactory::IsSupported()) {
+    AddBackendFactory(
+        factories,
+        VideoEncoderBackend::Hardware,
+        std::make_unique<webrtc::MediaFoundationVideoEncoderFactory>());
+    return;
+  }
+#else
+  (void)factories;
+#endif
+}
+
 }  // namespace
 
 using Factory = webrtc::VideoEncoderFactoryTemplate<
@@ -209,6 +230,14 @@ rust::Vec<VideoEncoderBackend> video_encoder_backend_list() {
   }
 #endif
 
+#if defined(USE_MF_VIDEO_CODEC)
+  if (webrtc::MediaFoundationVideoEncoderFactory::IsSupported()) {
+    backends.push_back(VideoEncoderBackend::Hardware);
+    has_hardware_backend = true;
+    hardware_backend_listed = true;
+  }
+#endif
+
   if (has_hardware_backend && !hardware_backend_listed) {
     backends.push_back(VideoEncoderBackend::Hardware);
   }
@@ -233,6 +262,7 @@ VideoEncoderFactory::InternalFactory::InternalFactory() {
 
   AddNvencFactory(factories_);
   AddVaapiFactory(factories_);
+  AddMediaFoundationFactory(factories_);
 }
 
 std::vector<webrtc::SdpVideoFormat>

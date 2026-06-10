@@ -18,8 +18,11 @@ use webrtc_sys::{rtc_error as sys_err, rtp_sender as sys_rs, webrtc as sys_webrt
 
 use super::media_stream_track::new_media_stream_track;
 use crate::{
-    media_stream_track::MediaStreamTrack, rtp_parameters::RtpParameters,
-    rtp_sender::VideoEncoderBackend, stats::RtcStats, RtcError, RtcErrorType,
+    media_stream_track::MediaStreamTrack,
+    rtp_parameters::RtpParameters,
+    rtp_sender::{DegradationPreference, VideoEncoderBackend},
+    stats::RtcStats,
+    RtcError, RtcErrorType,
 };
 
 #[derive(Clone)]
@@ -83,6 +86,24 @@ impl RtpSender {
 
     pub fn set_video_encoder_backend(&self, backend: VideoEncoderBackend) {
         self.sys_handle.set_video_encoder_backend(backend.into());
+    }
+
+    pub fn set_degradation_preference(&self, preference: DegradationPreference) {
+        let sys_pref = match preference {
+            DegradationPreference::Disabled => {
+                webrtc_sys::rtp_parameters::ffi::DegradationPreference::Disabled
+            }
+            DegradationPreference::MaintainFramerate => {
+                webrtc_sys::rtp_parameters::ffi::DegradationPreference::MaintainFramerate
+            }
+            DegradationPreference::MaintainResolution => {
+                webrtc_sys::rtp_parameters::ffi::DegradationPreference::MaintainResolution
+            }
+            DegradationPreference::Balanced => {
+                webrtc_sys::rtp_parameters::ffi::DegradationPreference::Balanced
+            }
+        };
+        self.sys_handle.set_degradation_preference(sys_pref);
     }
 }
 

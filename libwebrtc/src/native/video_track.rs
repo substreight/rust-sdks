@@ -53,4 +53,15 @@ impl RtcVideoTrack {
     pub fn packet_trailer_handler(&self) -> Option<PacketTrailerHandler> {
         self.packet_trailer_handler.lock().clone()
     }
+
+    pub fn set_content_hint(&self, hint: crate::video_track::ContentHint) {
+        use crate::video_track::ContentHint;
+        let sys_hint = match hint {
+            ContentHint::None => sys_vt::ffi::ContentHint::None,
+            ContentHint::Fluid => sys_vt::ffi::ContentHint::Fluid,
+            ContentHint::Detailed => sys_vt::ffi::ContentHint::Detailed,
+            ContentHint::Text => sys_vt::ffi::ContentHint::Text,
+        };
+        self.sys_handle.set_content_hint(sys_hint);
+    }
 }
