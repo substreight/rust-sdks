@@ -53,6 +53,7 @@ pub mod ffi {
         fn set_parameters(self: &RtpSender, parameters: RtpParameters) -> Result<()>;
         fn set_video_encoder_backend(self: &RtpSender, backend: VideoEncoderBackend);
         fn set_degradation_preference(self: &RtpSender, preference: DegradationPreference);
+        fn set_max_bitrate(self: &RtpSender, bitrate_bps: u64);
 
         fn _shared_rtp_sender() -> SharedPtr<RtpSender>;
     }

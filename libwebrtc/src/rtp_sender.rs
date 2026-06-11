@@ -110,6 +110,13 @@ impl RtpSender {
     pub fn set_degradation_preference(&self, preference: DegradationPreference) {
         self.handle.set_degradation_preference(preference)
     }
+
+    /// Runtime bitrate ceiling applied to every encoding. Used by adaptive
+    /// senders to pin their target below an observed congestion point. The
+    /// mutation happens natively (the Rust RtpParameters round-trip is lossy).
+    pub fn set_max_bitrate(&self, bitrate_bps: u64) {
+        self.handle.set_max_bitrate(bitrate_bps)
+    }
 }
 
 impl Debug for RtpSender {

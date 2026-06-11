@@ -230,4 +230,22 @@ void RtpSender::set_degradation_preference(
   }
 }
 
+void RtpSender::set_max_bitrate(uint64_t bitrate_bps) const {
+  // Runtime bitrate ceiling for adaptive senders. Same native-mutation rule
+  // as set_degradation_preference: the Rust round-trip drops encodings, so
+  // the GetParameters/SetParameters pair must not cross the FFI.
+  auto params = sender_->GetParameters();
+  if (params.encodings.empty()) {
+    RTC_LOG(LS_WARNING) << "set_max_bitrate: sender has no encodings";
+    return;
+  }
+  for (auto& encoding : params.encodings) {
+    encoding.max_bitrate_bps = static_cast<int>(bitrate_bps);
+  }
+  auto error = sender_->SetParameters(params);
+  if (!error.ok()) {
+    RTC_LOG(LS_WARNING) << "set_max_bitrate failed: " << error.message();
+  }
+}
+
 }  // namespace livekit_ffi

@@ -339,7 +339,7 @@ impl LocalParticipant {
                     }];
                 }
             }
-            LocalTrack::Audio(_audio_track) => {
+            LocalTrack::Audio(audio_track) => {
                 // Setup audio encoding
                 let audio_encoding =
                     options.audio_encoding.as_ref().unwrap_or(&options::audio::MUSIC.encoding);
@@ -348,6 +348,19 @@ impl LocalParticipant {
                     max_bitrate: Some(audio_encoding.max_bitrate),
                     ..Default::default()
                 });
+
+                // Advertise stereo for multi-channel sources. The offer-side
+                // `stereo=1` munging alone is not enough: since the server
+                // started clearing un-requested stereo (livekit PR #4101),
+                // the SFU strips it unless TF_STEREO is in AddTrackRequest
+                // and 2-channel sources get silently downmixed to mono
+                // (upstream issue #1018).
+                if audio_track.rtc_source().num_channels() >= 2 {
+                    req.audio_features.push(proto::AudioTrackFeature::TfStereo as i32);
+                    // Stereo + DTX interact poorly (livekit-client disables
+                    // DTX for stereo by default); honor the same rule.
+                    req.disable_dtx = true;
+                }
             }
         }
         let track_info = self.inner.rtc_engine.add_track(req).await?;

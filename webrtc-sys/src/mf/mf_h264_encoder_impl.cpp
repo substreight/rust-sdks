@@ -48,6 +48,10 @@ namespace {
 // session is wedged; we surface an encoder error so libwebrtc re-creates
 // the encoder (and the factory can fall back to software).
 constexpr int kPumpDeadlineMs = 250;
+// Cold hardware sessions need far longer to grant their FIRST credit (Intel
+// QSV first-ever activation has been measured in seconds; AMD warmup too).
+// A tight first deadline would dump perfectly good encoders to software.
+constexpr int kFirstPumpDeadlineMs = 2500;
 
 // Re-apply dynamic bitrate at most once a second; some vendor MFTs glitch
 // when CodecAPI values are hammered every SetRates() call (~30/s).
@@ -164,66 +168,99 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
   MFT_REGISTER_TYPE_INFO input_info = {MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO output_info = {MFMediaType_Video, MFVideoFormat_H264};
 
-  IMFActivate** activates = nullptr;
-  UINT32 count = 0;
-  HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                         &input_info, &output_info, &activates, &count);
-  if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_ERROR) << "MFTEnumEx found no hardware H264 encoder (hr="
-                      << HexHr(hr) << ")";
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
+  // Hardware MFTs are registered PER GPU ADAPTER, and a D3D device manager
+  // is only accepted by an MFT whose adapter matches the device's. Enumerate
+  // per adapter via MFTEnum2 + MFT_ENUM_ADAPTER_LUID (Chromium's approach)
+  // so every candidate is paired with the adapter its device must live on.
+  struct Candidate {
+    ComPtr<IMFActivate> activate;
+    LUID luid{};
+    bool has_luid = false;
+  };
+  std::vector<Candidate> candidates;
 
-  // Prepare one shared D3D11 device + DXGI device manager for all attempts.
-  // Many hardware MFTs are D3D-aware-only and reject SetOutputType with
-  // MF_E_UNSUPPORTED_D3D_TYPE (0xC00D6D76) until one is attached — even
-  // when fed CPU samples (the MFT uploads internally).
-  if (!dxgi_manager_) {
-    ComPtr<ID3D11Device> device;
-    static const D3D_FEATURE_LEVEL kLevels[] = {D3D_FEATURE_LEVEL_11_1,
-                                                D3D_FEATURE_LEVEL_11_0};
-    HRESULT dhr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, kLevels, ARRAYSIZE(kLevels),
-        D3D11_SDK_VERSION, &device, nullptr, nullptr);
-    if (SUCCEEDED(dhr) && device) {
-      ComPtr<ID3D11Multithread> multithread;
-      if (SUCCEEDED(device.As(&multithread)) && multithread) {
-        multithread->SetMultithreadProtected(TRUE);
+  ComPtr<IDXGIFactory1> dxgi_factory;
+  if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory)))) {
+    for (UINT i = 0;; i++) {
+      ComPtr<IDXGIAdapter1> adapter;
+      if (dxgi_factory->EnumAdapters1(i, &adapter) != S_OK) {
+        break;
       }
-      UINT reset_token = 0;
-      if (SUCCEEDED(MFCreateDXGIDeviceManager(&reset_token, &dxgi_manager_)) &&
-          dxgi_manager_ &&
-          SUCCEEDED(dxgi_manager_->ResetDevice(device.Get(), reset_token))) {
-        d3d_device_ = device;
-      } else {
-        dxgi_manager_.Reset();
+      DXGI_ADAPTER_DESC1 desc{};
+      if (FAILED(adapter->GetDesc1(&desc)) ||
+          (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+        continue;
       }
-    } else {
-      RTC_LOG(LS_WARNING) << "D3D11CreateDevice failed (hr=" << HexHr(dhr)
-                          << "); MFTs will negotiate without D3D";
+
+      ComPtr<IMFAttributes> attrs;
+      if (FAILED(MFCreateAttributes(&attrs, 1))) {
+        continue;
+      }
+      attrs->SetBlob(MFT_ENUM_ADAPTER_LUID,
+                     reinterpret_cast<const UINT8*>(&desc.AdapterLuid),
+                     sizeof(LUID));
+      IMFActivate** activates = nullptr;
+      UINT32 count = 0;
+      if (FAILED(MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER,
+                          MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                          &input_info, &output_info, attrs.Get(), &activates,
+                          &count))) {
+        continue;
+      }
+      for (UINT32 j = 0; j < count; j++) {
+        Candidate c;
+        c.activate.Attach(activates[j]);  // take ownership of the ref
+        c.luid = desc.AdapterLuid;
+        c.has_luid = true;
+        candidates.push_back(std::move(c));
+      }
+      if (activates) {
+        CoTaskMemFree(activates);
+      }
     }
   }
 
-  RTC_LOG(LS_INFO) << "MF encoder: " << count << " hardware H264 MFT(s)";
+  // Fallback (pre-1703 Windows or DXGI failure): flat enumeration with no
+  // adapter info — candidates run in system-memory mode, no D3D manager.
+  if (candidates.empty()) {
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    HRESULT hr =
+        MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                  MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                  &input_info, &output_info, &activates, &count);
+    if (FAILED(hr) || count == 0) {
+      RTC_LOG(LS_ERROR) << "No hardware H264 encoder MFT found (hr="
+                        << HexHr(hr) << ")";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    for (UINT32 j = 0; j < count; j++) {
+      Candidate c;
+      c.activate.Attach(activates[j]);
+      candidates.push_back(std::move(c));
+    }
+    if (activates) {
+      CoTaskMemFree(activates);
+    }
+  }
+
+  RTC_LOG(LS_INFO) << "MF encoder: " << candidates.size()
+                   << " hardware H264 MFT candidate(s)";
   int32_t result = WEBRTC_VIDEO_CODEC_ERROR;
-  for (UINT32 i = 0; i < count; i++) {
-    std::string name = GetActivateFriendlyName(activates[i]);
-    RTC_LOG(LS_INFO) << "MF encoder: trying MFT[" << i << "] \"" << name
-                     << "\"";
-    if (TryConfigureTransform(activates[i], name) == WEBRTC_VIDEO_CODEC_OK) {
+  for (auto& candidate : candidates) {
+    std::string name = GetActivateFriendlyName(candidate.activate.Get());
+    RTC_LOG(LS_INFO) << "MF encoder: trying MFT \"" << name << "\""
+                     << (candidate.has_luid ? " (adapter-matched)" : "");
+    if (TryConfigureTransform(candidate.activate.Get(), name,
+                              candidate.has_luid ? &candidate.luid
+                                                 : nullptr) ==
+        WEBRTC_VIDEO_CODEC_OK) {
       mft_friendly_name_ = name;
       result = WEBRTC_VIDEO_CODEC_OK;
       break;
     }
     ResetTransformState();
   }
-
-  for (UINT32 i = 0; i < count; i++) {
-    activates[i]->Release();
-  }
-  CoTaskMemFree(activates);
 
   if (result != WEBRTC_VIDEO_CODEC_OK) {
     RTC_LOG(LS_ERROR)
@@ -232,9 +269,67 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
   return result;
 }
 
+bool MediaFoundationH264EncoderImpl::EnsureDeviceManagerForAdapter(
+    const LUID& adapter_luid) {
+  if (dxgi_manager_ && dxgi_manager_luid_.HighPart == adapter_luid.HighPart &&
+      dxgi_manager_luid_.LowPart == adapter_luid.LowPart) {
+    return true;
+  }
+  dxgi_manager_.Reset();
+  d3d_device_.Reset();
+
+  ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    return false;
+  }
+  ComPtr<IDXGIAdapter1> adapter;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++) {
+    DXGI_ADAPTER_DESC1 desc{};
+    if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+        desc.AdapterLuid.HighPart == adapter_luid.HighPart &&
+        desc.AdapterLuid.LowPart == adapter_luid.LowPart) {
+      break;
+    }
+    adapter.Reset();
+  }
+  if (!adapter) {
+    return false;
+  }
+
+  ComPtr<ID3D11Device> device;
+  static const D3D_FEATURE_LEVEL kLevels[] = {D3D_FEATURE_LEVEL_11_1,
+                                              D3D_FEATURE_LEVEL_11_0};
+  // An explicit adapter requires D3D_DRIVER_TYPE_UNKNOWN.
+  HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN,
+                                 nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                 kLevels, ARRAYSIZE(kLevels), D3D11_SDK_VERSION,
+                                 &device, nullptr, nullptr);
+  if (FAILED(hr) || !device) {
+    RTC_LOG(LS_WARNING) << "MF encoder: D3D11CreateDevice on MFT adapter "
+                           "failed (hr="
+                        << HexHr(hr) << ")";
+    return false;
+  }
+  ComPtr<ID3D11Multithread> multithread;
+  if (SUCCEEDED(device.As(&multithread)) && multithread) {
+    multithread->SetMultithreadProtected(TRUE);
+  }
+  UINT reset_token = 0;
+  if (FAILED(MFCreateDXGIDeviceManager(&reset_token, &dxgi_manager_)) ||
+      !dxgi_manager_ ||
+      FAILED(dxgi_manager_->ResetDevice(device.Get(), reset_token))) {
+    dxgi_manager_.Reset();
+    return false;
+  }
+  d3d_device_ = device;
+  dxgi_manager_luid_ = adapter_luid;
+  return true;
+}
+
 int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     IMFActivate* activate,
-    const std::string& name) {
+    const std::string& name,
+    const LUID* adapter_luid) {
   HRESULT hr = activate->ActivateObject(IID_PPV_ARGS(&transform_));
   if (FAILED(hr) || !transform_) {
     RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": ActivateObject failed (hr="
@@ -254,15 +349,19 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     }
   }
 
-  // Attach the DXGI device manager BEFORE negotiating media types, but only
-  // to MFTs that declare D3D11 awareness (others return E_FAIL / E_NOTIMPL).
-  if (dxgi_manager_ && d3d_aware) {
+  // Attach a DXGI device manager BEFORE negotiating media types — but ONLY
+  // one whose device lives on the MFT's own adapter (cross-adapter managers
+  // are rejected with E_FAIL), and only to MFTs declaring D3D11 awareness.
+  bool manager_attached = false;
+  if (d3d_aware && adapter_luid &&
+      EnsureDeviceManagerForAdapter(*adapter_luid)) {
     HRESULT mhr = transform_->ProcessMessage(
         MFT_MESSAGE_SET_D3D_MANAGER,
         reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get()));
     if (SUCCEEDED(mhr)) {
-      RTC_LOG(LS_INFO) << "MFT \"" << name << "\": DXGI device manager "
-                          "attached";
+      manager_attached = true;
+      RTC_LOG(LS_INFO) << "MFT \"" << name
+                       << "\": adapter-matched DXGI device manager attached";
     } else {
       RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected D3D manager "
                              "(hr=" << HexHr(mhr) << "); continuing without";
@@ -290,23 +389,26 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     output_stream_id_ = 0;
   }
 
-  // Rate control + latency knobs (best effort; vendors vary).
+  // Rate control + latency knobs (best effort; vendors vary). Every
+  // rejection is logged: a silently-ignored knob (B-frames, VBR) is the
+  // difference between smooth and weird on some driver stacks.
   if (SUCCEEDED(transform_.As(&codec_api_)) && codec_api_) {
-    HRESULT rc = SetCodecApiU32(codec_api_.Get(),
-                                CODECAPI_AVEncCommonRateControlMode,
-                                eAVEncCommonRateControlMode_CBR);
-    if (FAILED(rc)) {
-      RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected CBR (hr="
-                          << HexHr(rc) << ")";
-    }
-    SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                   target_bitrate_bps_);
-    SetCodecApiU32(codec_api_.Get(), CODECAPI_AVLowLatencyMode, TRUE);
-    SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    auto set_knob = [&](const GUID& guid, UINT32 value, const char* knob) {
+      HRESULT rc = SetCodecApiU32(codec_api_.Get(), guid, value);
+      if (FAILED(rc)) {
+        RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected " << knob
+                            << " (hr=" << HexHr(rc) << ")";
+      }
+    };
+    set_knob(CODECAPI_AVEncCommonRateControlMode,
+             eAVEncCommonRateControlMode_CBR, "CBR rate control");
+    set_knob(CODECAPI_AVEncCommonMeanBitRate, target_bitrate_bps_,
+             "mean bitrate");
+    set_knob(CODECAPI_AVLowLatencyMode, TRUE, "low-latency mode");
+    set_knob(CODECAPI_AVEncMPVDefaultBPictureCount, 0, "B-frame disable");
     // Long GOP; recovery uses PLI-driven forced IDRs rather than periodic
     // keyframes (matches the NVENC impl's infinite-GOP approach).
-    SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncMPVGOPSize,
-                   codec_.maxFramerate * 10);
+    set_knob(CODECAPI_AVEncMPVGOPSize, codec_.maxFramerate * 10, "GOP size");
     configured_bitrate_bps_ = target_bitrate_bps_;
   } else {
     RTC_LOG(LS_WARNING) << "MFT \"" << name
@@ -332,6 +434,17 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
   // profile rtc_session prefers. B frames are disabled via CodecAPI.
   output_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
   hr = transform_->SetOutputType(output_stream_id_, output_type.Get(), 0);
+  if (hr == MF_E_UNSUPPORTED_D3D_TYPE && manager_attached) {
+    // Documented contract for D3D-aware MFTs: on MF_E_UNSUPPORTED_D3D_TYPE,
+    // detach the manager (SET_D3D_MANAGER with NULL) so the MFT reverts to
+    // system-memory intake, then retry. Leaving a half-set manager in place
+    // keeps every subsequent type negotiation failing.
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": D3D type rejected; "
+                           "reverting to system-memory mode and retrying";
+    transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    manager_attached = false;
+    hr = transform_->SetOutputType(output_stream_id_, output_type.Get(), 0);
+  }
   if (FAILED(hr)) {
     RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": SetOutputType(H264) "
                            "failed (hr=" << HexHr(hr) << ")";
@@ -357,6 +470,29 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": SetInputType(NV12) "
                            "failed (hr=" << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
+  // Honor the stride the MFT actually negotiated — some vendors (notably
+  // Intel) pad rows past the frame width, and feeding width-stride buffers
+  // to a padded-stride type corrupts or rejects frames.
+  input_stride_ = codec_.width;
+  ComPtr<IMFMediaType> negotiated_input;
+  if (SUCCEEDED(transform_->GetInputCurrentType(input_stream_id_,
+                                                &negotiated_input)) &&
+      negotiated_input) {
+    UINT32 stride = 0;
+    if (SUCCEEDED(negotiated_input->GetUINT32(MF_MT_DEFAULT_STRIDE,
+                                              &stride))) {
+      // Negative strides (bottom-up) arrive as huge UINT32 values; only
+      // accept sane top-down strides at least as wide as the frame.
+      if (static_cast<INT32>(stride) >= static_cast<INT32>(codec_.width)) {
+        input_stride_ = stride;
+        if (stride != codec_.width) {
+          RTC_LOG(LS_INFO) << "MFT \"" << name << "\": padded input stride "
+                           << stride << " (width " << codec_.width << ")";
+        }
+      }
+    }
   }
 
   MFT_OUTPUT_STREAM_INFO stream_info = {};
@@ -394,6 +530,10 @@ void MediaFoundationH264EncoderImpl::ResetTransformState() {
   output_provides_samples_ = true;
   output_buffer_size_ = 0;
   input_credits_ = 0;
+  input_stride_ = 0;
+  got_first_input_credit_ = false;
+  // dxgi_manager_/d3d_device_ are deliberately kept: they're keyed by
+  // adapter LUID and reusable across candidates on the same adapter.
 }
 
 int32_t MediaFoundationH264EncoderImpl::RegisterEncodeCompleteCallback(
@@ -474,9 +614,14 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
   force_key_frame_ = false;
 
   // I420 -> NV12 into an MF sample (CPU path; ~1-2ms at 1440p via libyuv).
+  // Rows use the stride the MFT negotiated (>= width on padding vendors).
   const int width = frame_buffer->width();
   const int height = frame_buffer->height();
-  const DWORD nv12_size = static_cast<DWORD>(width) * height * 3 / 2;
+  const int stride =
+      static_cast<int>(input_stride_ >= static_cast<uint32_t>(width)
+                           ? input_stride_
+                           : static_cast<uint32_t>(width));
+  const DWORD nv12_size = static_cast<DWORD>(stride) * height * 3 / 2;
 
   ComPtr<IMFMediaBuffer> media_buffer;
   HRESULT hr =
@@ -493,11 +638,11 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
   uint8_t* dst_y = dst;
-  uint8_t* dst_uv = dst + static_cast<size_t>(width) * height;
+  uint8_t* dst_uv = dst + static_cast<size_t>(stride) * height;
   libyuv::I420ToNV12(frame_buffer->DataY(), frame_buffer->StrideY(),
                      frame_buffer->DataU(), frame_buffer->StrideU(),
                      frame_buffer->DataV(), frame_buffer->StrideV(), dst_y,
-                     width, dst_uv, width, width, height);
+                     stride, dst_uv, stride, width, height);
   media_buffer->Unlock();
   media_buffer->SetCurrentLength(nv12_size);
 
@@ -531,7 +676,9 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
 
 int32_t MediaFoundationH264EncoderImpl::PumpEvents(
     bool wait_for_input_credit) {
-  const int64_t deadline_ms = TimeMillis() + kPumpDeadlineMs;
+  const int64_t deadline_ms =
+      TimeMillis() +
+      (got_first_input_credit_ ? kPumpDeadlineMs : kFirstPumpDeadlineMs);
 
   while (true) {
     if (pending_input_ && input_credits_ > 0) {
@@ -565,6 +712,7 @@ int32_t MediaFoundationH264EncoderImpl::PumpEvents(
     event->GetType(&type);
     switch (type) {
       case METransformNeedInput:
+        got_first_input_credit_ = true;
         input_credits_++;
         break;
       case METransformHaveOutput: {

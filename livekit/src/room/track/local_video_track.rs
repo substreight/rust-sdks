@@ -247,6 +247,18 @@ impl LocalVideoTrack {
         super::local_track::get_stats(&self.inner).await
     }
 
+    /// Apply a runtime bitrate ceiling to this published track's sender.
+    /// Returns false when the track has no transceiver yet (not published).
+    /// Used by adaptive senders to pin their target below an observed
+    /// congestion point instead of repeatedly colliding with it.
+    pub fn set_publish_max_bitrate(&self, bitrate_bps: u64) -> bool {
+        let Some(transceiver) = self.transceiver() else {
+            return false;
+        };
+        transceiver.sender().set_max_bitrate(bitrate_bps);
+        true
+    }
+
     pub(crate) fn on_muted(&self, f: impl Fn(Track) + Send + 'static) {
         self.inner.events.lock().muted.replace(Box::new(f));
     }

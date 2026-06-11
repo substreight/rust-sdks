@@ -105,6 +105,10 @@ impl RtpSender {
         };
         self.sys_handle.set_degradation_preference(sys_pref);
     }
+
+    pub fn set_max_bitrate(&self, bitrate_bps: u64) {
+        self.sys_handle.set_max_bitrate(bitrate_bps);
+    }
 }
 
 impl From<VideoEncoderBackend> for sys_webrtc::ffi::VideoEncoderBackend {
