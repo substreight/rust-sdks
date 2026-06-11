@@ -21,7 +21,9 @@
 #include <initguid.h>
 
 #include <codecapi.h>
+#include <d3d11_4.h>
 #include <mferror.h>
+#include <objbase.h>
 
 #include <algorithm>
 #include <utility>
@@ -57,6 +59,29 @@ HRESULT SetCodecApiU32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   var.vt = VT_UI4;
   var.ulVal = value;
   return api->SetValue(&guid, &var);
+}
+
+// RTC_LOG's stream does not understand std::hex (it prints the manipulator's
+// function pointer); format HRESULTs by hand.
+std::string HexHr(HRESULT hr) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "0x%08lX", static_cast<unsigned long>(hr));
+  return buf;
+}
+
+std::string GetActivateFriendlyName(IMFActivate* activate) {
+  WCHAR name_buf[256] = {};
+  UINT32 name_len = 0;
+  if (FAILED(activate->GetString(MFT_FRIENDLY_NAME_Attribute, name_buf,
+                                 ARRAYSIZE(name_buf), &name_len))) {
+    return "<unnamed MFT>";
+  }
+  int utf8_len = WideCharToMultiByte(CP_UTF8, 0, name_buf, name_len, nullptr,
+                                     0, nullptr, nullptr);
+  std::string utf8(utf8_len, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, name_buf, name_len, utf8.data(), utf8_len,
+                      nullptr, nullptr);
+  return utf8;
 }
 
 }  // namespace
@@ -122,6 +147,16 @@ int32_t MediaFoundationH264EncoderImpl::InitEncode(
 }
 
 int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
+  // libwebrtc's encoder task-queue thread has no COM apartment, and
+  // IMFActivate::ActivateObject is COM object creation — without this the
+  // hardware MFT activates fine in probes (main thread) but fails here in
+  // production. Join the MTA once per thread; deliberately never
+  // uninitialized (encoder threads are long-lived). S_FALSE and
+  // RPC_E_CHANGED_MODE both leave COM usable.
+  thread_local const HRESULT com_init =
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  (void)com_init;
+
   if (!MediaFoundationVideoEncoderFactory::IsSupported()) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -135,24 +170,54 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
                          MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                          &input_info, &output_info, &activates, &count);
   if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_ERROR) << "MFTEnumEx found no hardware H264 encoder (hr=0x"
-                      << std::hex << hr << ")";
+    RTC_LOG(LS_ERROR) << "MFTEnumEx found no hardware H264 encoder (hr="
+                      << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  hr = activates[0]->ActivateObject(IID_PPV_ARGS(&transform_));
+  // Prepare one shared D3D11 device + DXGI device manager for all attempts.
+  // Many hardware MFTs are D3D-aware-only and reject SetOutputType with
+  // MF_E_UNSUPPORTED_D3D_TYPE (0xC00D6D76) until one is attached — even
+  // when fed CPU samples (the MFT uploads internally).
+  if (!dxgi_manager_) {
+    ComPtr<ID3D11Device> device;
+    static const D3D_FEATURE_LEVEL kLevels[] = {D3D_FEATURE_LEVEL_11_1,
+                                                D3D_FEATURE_LEVEL_11_0};
+    HRESULT dhr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, kLevels, ARRAYSIZE(kLevels),
+        D3D11_SDK_VERSION, &device, nullptr, nullptr);
+    if (SUCCEEDED(dhr) && device) {
+      ComPtr<ID3D11Multithread> multithread;
+      if (SUCCEEDED(device.As(&multithread)) && multithread) {
+        multithread->SetMultithreadProtected(TRUE);
+      }
+      UINT reset_token = 0;
+      if (SUCCEEDED(MFCreateDXGIDeviceManager(&reset_token, &dxgi_manager_)) &&
+          dxgi_manager_ &&
+          SUCCEEDED(dxgi_manager_->ResetDevice(device.Get(), reset_token))) {
+        d3d_device_ = device;
+      } else {
+        dxgi_manager_.Reset();
+      }
+    } else {
+      RTC_LOG(LS_WARNING) << "D3D11CreateDevice failed (hr=" << HexHr(dhr)
+                          << "); MFTs will negotiate without D3D";
+    }
+  }
 
-  // Capture the friendly name for stats/diagnostics.
-  WCHAR name_buf[256] = {};
-  UINT32 name_len = 0;
-  if (SUCCEEDED(activates[0]->GetString(MFT_FRIENDLY_NAME_Attribute, name_buf,
-                                        ARRAYSIZE(name_buf), &name_len))) {
-    int utf8_len = WideCharToMultiByte(CP_UTF8, 0, name_buf, name_len, nullptr,
-                                       0, nullptr, nullptr);
-    std::string utf8(utf8_len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, name_buf, name_len, utf8.data(), utf8_len,
-                        nullptr, nullptr);
-    mft_friendly_name_ = std::move(utf8);
+  RTC_LOG(LS_INFO) << "MF encoder: " << count << " hardware H264 MFT(s)";
+  int32_t result = WEBRTC_VIDEO_CODEC_ERROR;
+  for (UINT32 i = 0; i < count; i++) {
+    std::string name = GetActivateFriendlyName(activates[i]);
+    RTC_LOG(LS_INFO) << "MF encoder: trying MFT[" << i << "] \"" << name
+                     << "\"";
+    if (TryConfigureTransform(activates[i], name) == WEBRTC_VIDEO_CODEC_OK) {
+      mft_friendly_name_ = name;
+      result = WEBRTC_VIDEO_CODEC_OK;
+      break;
+    }
+    ResetTransformState();
   }
 
   for (UINT32 i = 0; i < count; i++) {
@@ -160,23 +225,56 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
   }
   CoTaskMemFree(activates);
 
+  if (result != WEBRTC_VIDEO_CODEC_OK) {
+    RTC_LOG(LS_ERROR)
+        << "MF encoder: no hardware MFT accepted our configuration";
+  }
+  return result;
+}
+
+int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
+    IMFActivate* activate,
+    const std::string& name) {
+  HRESULT hr = activate->ActivateObject(IID_PPV_ARGS(&transform_));
   if (FAILED(hr) || !transform_) {
-    RTC_LOG(LS_ERROR) << "Failed to activate H264 encoder MFT (hr=0x"
-                      << std::hex << hr << ")";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": ActivateObject failed (hr="
+                        << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
   // Hardware encoder MFTs are async: unlock them and request low latency.
   ComPtr<IMFAttributes> attributes;
+  bool d3d_aware = false;
   if (SUCCEEDED(transform_->GetAttributes(&attributes)) && attributes) {
     attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
     attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
+    UINT32 aware = 0;
+    if (SUCCEEDED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &aware))) {
+      d3d_aware = aware != 0;
+    }
+  }
+
+  // Attach the DXGI device manager BEFORE negotiating media types, but only
+  // to MFTs that declare D3D11 awareness (others return E_FAIL / E_NOTIMPL).
+  if (dxgi_manager_ && d3d_aware) {
+    HRESULT mhr = transform_->ProcessMessage(
+        MFT_MESSAGE_SET_D3D_MANAGER,
+        reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get()));
+    if (SUCCEEDED(mhr)) {
+      RTC_LOG(LS_INFO) << "MFT \"" << name << "\": DXGI device manager "
+                          "attached";
+    } else {
+      RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected D3D manager "
+                             "(hr=" << HexHr(mhr) << "); continuing without";
+    }
+  } else if (!d3d_aware) {
+    RTC_LOG(LS_INFO) << "MFT \"" << name << "\": not D3D11-aware";
   }
 
   hr = transform_.As(&event_generator_);
   if (FAILED(hr) || !event_generator_) {
-    RTC_LOG(LS_ERROR) << "H264 encoder MFT is not an event generator (not "
-                         "async?); unsupported.";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": not an event generator "
+                           "(not async?); skipping.";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
@@ -198,8 +296,8 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
                                 CODECAPI_AVEncCommonRateControlMode,
                                 eAVEncCommonRateControlMode_CBR);
     if (FAILED(rc)) {
-      RTC_LOG(LS_WARNING) << "MFT rejected CBR rate control (hr=0x" << std::hex
-                          << rc << ")";
+      RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected CBR (hr="
+                          << HexHr(rc) << ")";
     }
     SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
                    target_bitrate_bps_);
@@ -211,8 +309,8 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
                    codec_.maxFramerate * 10);
     configured_bitrate_bps_ = target_bitrate_bps_;
   } else {
-    RTC_LOG(LS_WARNING)
-        << "H264 encoder MFT exposes no ICodecAPI; using type defaults.";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name
+                        << "\": no ICodecAPI; using type defaults.";
   }
 
   // Output type FIRST (encoder MFTs negotiate input against output).
@@ -235,8 +333,8 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
   output_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
   hr = transform_->SetOutputType(output_stream_id_, output_type.Get(), 0);
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "SetOutputType(H264) failed (hr=0x" << std::hex << hr
-                      << ")";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": SetOutputType(H264) "
+                           "failed (hr=" << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
@@ -256,8 +354,8 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
   input_type->SetUINT32(MF_MT_DEFAULT_STRIDE, codec_.width);
   hr = transform_->SetInputType(input_stream_id_, input_type.Get(), 0);
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "SetInputType(NV12) failed (hr=0x" << std::hex << hr
-                      << ")";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": SetInputType(NV12) "
+                           "failed (hr=" << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
@@ -277,13 +375,25 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
 
   hr = transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "NOTIFY_BEGIN_STREAMING failed (hr=0x" << std::hex
-                      << hr << ")";
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": NOTIFY_BEGIN_STREAMING "
+                           "failed (hr=" << HexHr(hr) << ")";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
   transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MediaFoundationH264EncoderImpl::ResetTransformState() {
+  pending_input_.Reset();
+  codec_api_.Reset();
+  event_generator_.Reset();
+  transform_.Reset();
+  input_stream_id_ = 0;
+  output_stream_id_ = 0;
+  output_provides_samples_ = true;
+  output_buffer_size_ = 0;
+  input_credits_ = 0;
 }
 
 int32_t MediaFoundationH264EncoderImpl::RegisterEncodeCompleteCallback(
@@ -302,6 +412,8 @@ int32_t MediaFoundationH264EncoderImpl::Release() {
   codec_api_.Reset();
   event_generator_.Reset();
   transform_.Reset();
+  dxgi_manager_.Reset();
+  d3d_device_.Reset();
   pending_frames_.clear();
   input_credits_ = 0;
   initialized_ = false;
@@ -332,7 +444,7 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
       input_frame.video_frame_buffer()->ToI420();
   if (!frame_buffer) {
     RTC_LOG(LS_ERROR) << "Failed to convert input image to I420.";
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
 
   if (frame_buffer->width() != codec_.width ||
@@ -371,14 +483,14 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
       MFCreateAlignedMemoryBuffer(nv12_size, MF_64_BYTE_ALIGNMENT,
                                   &media_buffer);
   if (FAILED(hr)) {
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
 
   BYTE* dst = nullptr;
   DWORD max_len = 0;
   hr = media_buffer->Lock(&dst, &max_len, nullptr);
   if (FAILED(hr)) {
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
   uint8_t* dst_y = dst;
   uint8_t* dst_uv = dst + static_cast<size_t>(width) * height;
@@ -392,7 +504,7 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
   ComPtr<IMFSample> sample;
   hr = MFCreateSample(&sample);
   if (FAILED(hr)) {
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
   sample->AddBuffer(media_buffer.Get());
 
@@ -438,15 +550,15 @@ int32_t MediaFoundationH264EncoderImpl::PumpEvents(
       if (TimeMillis() > deadline_ms) {
         RTC_LOG(LS_ERROR)
             << "MF encoder stalled waiting for input credit; resetting.";
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
       }
       ::Sleep(1);
       continue;
     }
     if (FAILED(hr)) {
-      RTC_LOG(LS_ERROR) << "IMFMediaEventGenerator::GetEvent failed (hr=0x"
-                        << std::hex << hr << ")";
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      RTC_LOG(LS_ERROR) << "IMFMediaEventGenerator::GetEvent failed (hr="
+                        << HexHr(hr) << ")";
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
 
     MediaEventType type = MEUnknown;
@@ -468,9 +580,9 @@ int32_t MediaFoundationH264EncoderImpl::PumpEvents(
       case MEError: {
         HRESULT status = S_OK;
         event->GetStatus(&status);
-        RTC_LOG(LS_ERROR) << "MF encoder MEError (hr=0x" << std::hex << status
+        RTC_LOG(LS_ERROR) << "MF encoder MEError (hr=" << HexHr(status)
                           << ")";
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
       }
       default:
         break;
@@ -482,9 +594,8 @@ int32_t MediaFoundationH264EncoderImpl::DeliverPendingInput() {
   HRESULT hr = transform_->ProcessInput(input_stream_id_,
                                         pending_input_.Get(), 0);
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "MFT ProcessInput failed (hr=0x" << std::hex << hr
-                      << ")";
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    RTC_LOG(LS_ERROR) << "MFT ProcessInput failed (hr=" << HexHr(hr) << ")";
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
   input_credits_--;
   pending_input_.Reset();
@@ -500,7 +611,7 @@ int32_t MediaFoundationH264EncoderImpl::DrainOneOutput() {
     ComPtr<IMFMediaBuffer> buffer;
     if (FAILED(MFCreateMemoryBuffer(output_buffer_size_, &buffer)) ||
         FAILED(MFCreateSample(&our_sample))) {
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
     our_sample->AddBuffer(buffer.Get());
     output.pSample = our_sample.Get();
@@ -522,12 +633,11 @@ int32_t MediaFoundationH264EncoderImpl::DrainOneOutput() {
     return WEBRTC_VIDEO_CODEC_OK;
   }
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "MFT ProcessOutput failed (hr=0x" << std::hex << hr
-                      << ")";
+    RTC_LOG(LS_ERROR) << "MFT ProcessOutput failed (hr=" << HexHr(hr) << ")";
     if (output.pEvents) {
       output.pEvents->Release();
     }
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
 
   ComPtr<IMFSample> out_sample;
@@ -548,14 +658,14 @@ int32_t MediaFoundationH264EncoderImpl::ProcessOutputSample(
   ComPtr<IMFMediaBuffer> buffer;
   HRESULT hr = sample->ConvertToContiguousBuffer(&buffer);
   if (FAILED(hr)) {
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
 
   BYTE* data = nullptr;
   DWORD len = 0;
   hr = buffer->Lock(&data, nullptr, &len);
   if (FAILED(hr) || len == 0) {
-    return FAILED(hr) ? WEBRTC_VIDEO_CODEC_ENCODER_FAILURE
+    return FAILED(hr) ? WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE
                       : WEBRTC_VIDEO_CODEC_OK;
   }
 
