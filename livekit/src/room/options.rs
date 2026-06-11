@@ -139,6 +139,12 @@ pub struct TrackPublishOptions {
     /// suits motion content (games); the libwebrtc default for screenshare
     /// sources is maintain-resolution, which drops frames under load.
     pub degradation_preference: Option<DegradationPreference>,
+    /// Downscale factor applied to the (single) RTP encoding when simulcast
+    /// is off. Lets a publisher share one VideoSource between a full-quality
+    /// track and a low-bitrate preview track: libwebrtc scales the input
+    /// before encoding, so no second capture/scale pipeline is needed.
+    /// Ignored when simulcast or an explicit scalability_mode is set.
+    pub scale_resolution_down_by: Option<f64>,
 }
 
 impl Default for TrackPublishOptions {
@@ -158,6 +164,7 @@ impl Default for TrackPublishOptions {
             video_encoder: VideoEncoderBackend::Auto,
             scalability_mode: None,
             degradation_preference: None,
+            scale_resolution_down_by: None,
         }
     }
 }
@@ -210,7 +217,13 @@ pub fn compute_video_encodings(
     }
 
     if !options.simulcast {
-        return into_rtp_encodings(width, height, &[initial_preset]);
+        let mut encodings = into_rtp_encodings(width, height, &[initial_preset]);
+        if let Some(scale) = options.scale_resolution_down_by {
+            if let Some(first) = encodings.first_mut() {
+                first.scale_resolution_down_by = Some(f64::max(1.0, scale));
+            }
+        }
+        return encodings;
     }
 
     let mut simulcast_presets = match options.simulcast_layers {
