@@ -16,13 +16,20 @@
 
 #include "livekit/peer_connection_factory.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/create_modular_peer_connection_factory.h"
+#include "api/environment/deprecated_global_field_trials.h"
 #include "api/environment/environment_factory.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
@@ -49,11 +56,94 @@ namespace livekit_ffi {
 
 class PeerConnectionObserver;
 
+namespace {
+
+// Sanity check for "Trial1/Group1/Trial2/Group2/" strings: the legacy
+// global registry used below only DCHECKs the format (release builds would
+// silently misparse), and the input is a user-controlled env var.
+bool LooksLikeValidFieldTrialsString(const std::string& s) {
+  if (s.empty() || s.back() != '/') {
+    return false;
+  }
+  size_t segments = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '/') {
+      if (i == start) {
+        return false;  // empty segment
+      }
+      ++segments;
+      start = i + 1;
+    }
+  }
+  return segments % 2 == 0;
+}
+
+// Field-trial injection point. CAIRN_WEBRTC_FIELD_TRIALS holds a standard
+// libwebrtc trial string, e.g.
+//   WebRTC-Bwe-ProbingConfiguration/alr_interval:2s,alr_scale:3/
+//   WebRTC-Video-MinVideoBitrate/Enabled,h264_br:2500kbps/
+// (note: some trials require the "Enabled" group prefix). Default empty —
+// no behavior change unless the host opts in. The factory is a per-session
+// singleton, so trials can change between shares without an app restart.
+//
+// Uses the deprecated GLOBAL registry rather than webrtc::FieldTrials: the
+// prebuilt LiveKit webrtc.lib ships DeprecatedGlobalFieldTrials but does
+// not compile api/field_trials.cc, so FieldTrials::Create does not link.
+webrtc::Environment CreateEnvironmentWithFieldTrials() {
+  webrtc::EnvironmentFactory factory;
+  std::string trials;
+#ifdef _WIN32
+  // GetEnvironmentVariableW, not CRT getenv: the host (Rust std::env) sets
+  // variables via SetEnvironmentVariableW, which does not refresh the CRT's
+  // cached _environ, so getenv() can miss values set after process start.
+  wchar_t buf[4096];
+  DWORD len =
+      ::GetEnvironmentVariableW(L"CAIRN_WEBRTC_FIELD_TRIALS", buf, 4096);
+  if (len > 0 && len < 4096) {
+    int utf8_len = ::WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(len),
+                                         nullptr, 0, nullptr, nullptr);
+    trials.resize(utf8_len);
+    ::WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(len),
+                          trials.data(), utf8_len, nullptr, nullptr);
+  }
+#else
+  const char* raw = std::getenv("CAIRN_WEBRTC_FIELD_TRIALS");
+  if (raw) {
+    trials = raw;
+  }
+#endif
+  if (!trials.empty()) {
+    if (LooksLikeValidFieldTrialsString(trials)) {
+      RTC_LOG(LS_INFO) << "WebRTC field trials active: " << trials;
+      // The global registry stores the RAW POINTER — the string must outlive
+      // the process. Deliberately leaked (at most once per factory creation,
+      // i.e. per streaming session with a changed value).
+      char* leaked = new char[trials.size() + 1];
+      memcpy(leaked, trials.c_str(), trials.size() + 1);
+      webrtc::DeprecatedGlobalFieldTrials::Set(leaked);
+      factory.Set(std::make_unique<webrtc::DeprecatedGlobalFieldTrials>());
+    } else {
+      RTC_LOG(LS_ERROR) << "CAIRN_WEBRTC_FIELD_TRIALS is malformed (want "
+                           "\"Trial/Group/.../\") and was ignored: "
+                        << trials;
+    }
+  }
+  return factory.Create();
+}
+
+}  // namespace
+
 PeerConnectionFactory::PeerConnectionFactory(
     std::shared_ptr<RtcRuntime> rtc_runtime)
     : rtc_runtime_(rtc_runtime),
-    env_(webrtc::EnvironmentFactory().Create()) {
+    env_(CreateEnvironmentWithFieldTrials()) {
   webrtc::PeerConnectionFactoryDependencies dependencies;
+  // Hand the factory OUR Environment (which carries the field trials).
+  // Without this, CreateModularPeerConnectionFactory builds its own default
+  // Environment and the trials silently never reach BWE / the probe
+  // controller / the quality scaler — env_ alone only feeds the AdmProxy.
+  dependencies.env = env_;
   dependencies.network_thread = rtc_runtime_->network_thread();
   dependencies.worker_thread = rtc_runtime_->worker_thread();
   dependencies.signaling_thread = rtc_runtime_->signaling_thread();
