@@ -357,7 +357,17 @@ impl PeerTransport {
                     // <->1440p flapping). Floor at 40% of the start estimate so
                     // brief dips ride through; genuinely bad links still adapt
                     // below it slowly via loss-based fallback.
-                    let min_bitrate_kbps = (start_bitrate_kbps * 2 / 5).max(1000);
+                    //
+                    // Capped at 6000 kbps: an uncapped 40% floor scales with the
+                    // publish tier (1440p60 -> ~7.9M, 4K60 -> ~12.7M), which
+                    // exceeds real uplinks on constrained/TURN paths — BWE can't
+                    // back off below the floor, so queues build and burst-drain
+                    // (rhythmic hitching), and a HIGHER quality tier hitches
+                    // HARDER. 6000 also keeps the SDP floor at or below the app
+                    // side's adaptive-controller floor (ADAPT_FLOOR_BPS = 6M in
+                    // Cairn's streaming.rs) so the two controllers never issue
+                    // contradictory min/max targets.
+                    let min_bitrate_kbps = (start_bitrate_kbps * 2 / 5).clamp(1000, 6000);
                     if let Some(pos) = rewritten.find("x-google-min-bitrate=") {
                         let after = &rewritten[pos..];
                         let end =
