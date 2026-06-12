@@ -249,8 +249,11 @@ void RtpSender::set_max_bitrate(uint64_t bitrate_bps) const {
        ++it) {
     const int64_t it_rate = it->max_bitrate_bps.value_or(-1);
     const int64_t top_rate = top->max_bitrate_bps.value_or(-1);
-    if (it_rate >= top_rate) {
-      top = it;  // ties pick the LAST encoding (SDK orders low -> full)
+    if (it_rate > top_rate) {
+      // Strictly greater: ties keep the FIRST encoding — the SDK's
+      // into_rtp_encodings orders encodings full-first, so an all-unset or
+      // tied list must not pick the low simulcast layer.
+      top = it;
     }
   }
   top->max_bitrate_bps = static_cast<int>(bitrate_bps);

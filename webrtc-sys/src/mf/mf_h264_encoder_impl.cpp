@@ -72,6 +72,16 @@ HRESULT SetCodecApiU32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   return api->SetValue(&guid, &var);
 }
 
+// Boolean CodecAPI properties are documented as VARIANT_BOOL; strict
+// vendors (Intel/Qualcomm HMFTs) reject a VT_UI4 in their place.
+HRESULT SetCodecApiBool(ICodecAPI* api, const GUID& guid, bool value) {
+  VARIANT var;
+  VariantInit(&var);
+  var.vt = VT_BOOL;
+  var.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
+  return api->SetValue(&guid, &var);
+}
+
 // HRD/VBV size in bits: ~0.75s of the target rate. Big enough that the
 // rate controller averages across IDRs instead of starving the frames
 // after each one; small enough that an IDR burst can't add a second of
@@ -169,6 +179,10 @@ int32_t MediaFoundationH264EncoderImpl::InitEncode(
   pending_frames_.clear();
   input_credits_ = 0;
   pending_input_.Reset();
+  // A rate re-init queued against the PREVIOUS session is moot: this fresh
+  // session is already configured at the new target. A stale flag would
+  // flush/retype the brand-new transform on its first Encode for nothing.
+  pending_rate_reinit_ = false;
   force_key_frame_ = true;  // first frame must be an IDR
   sending_ = true;
   initialized_ = true;
@@ -336,7 +350,15 @@ bool MediaFoundationH264EncoderImpl::EnsureDeviceManagerForAdapter(
     const LUID& adapter_luid) {
   if (dxgi_manager_ && dxgi_manager_luid_.HighPart == adapter_luid.HighPart &&
       dxgi_manager_luid_.LowPart == adapter_luid.LowPart) {
-    return true;
+    // Health-check the cached device: after a GPU timeout/TDR the driver
+    // can recover under the SAME LUID with our device in the REMOVED state.
+    // Reusing it would fail every candidate's type negotiation and pin the
+    // session to the software fallback for the encoder's lifetime.
+    if (d3d_device_ && d3d_device_->GetDeviceRemovedReason() == S_OK) {
+      return true;
+    }
+    RTC_LOG(LS_WARNING) << "MF encoder: cached D3D device was removed "
+                           "(TDR/driver reset); recreating";
   }
   dxgi_manager_.Reset();
   d3d_device_.Reset();
@@ -510,7 +532,13 @@ void MediaFoundationH264EncoderImpl::ApplyCodecApiKnobs(
   set_knob(CODECAPI_AVEncVideoMaxQP, 40, "max QP");
   if (high_profile_) {
     // High alone doesn't guarantee CABAC on all vendors; ask explicitly.
-    set_knob(CODECAPI_AVEncH264CABACEnable, TRUE, "CABAC");
+    // VT_BOOL, not VT_UI4 — strict vendors reject the wrong VARIANT type.
+    HRESULT rc =
+        SetCodecApiBool(codec_api_.Get(), CODECAPI_AVEncH264CABACEnable, true);
+    if (FAILED(rc)) {
+      RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected CABAC (hr="
+                          << HexHr(rc) << ")";
+    }
   }
   configured_bitrate_bps_ = target_bitrate_bps_;
 }
@@ -614,6 +642,11 @@ int32_t MediaFoundationH264EncoderImpl::ConfigureMediaTypes(
     output_buffer_size_ =
         static_cast<DWORD>(codec_.width) * codec_.height * 2;
   }
+  // MF_MT_AVG_BITRATE above applied the target regardless of ICodecAPI —
+  // latch it HERE, not (only) in ApplyCodecApiKnobs, whose null-codec_api_
+  // early-return would leave configured_bitrate_bps_ at 0 forever and feed
+  // SetRates' drift check a permanent ">=30%" (re-init loop every 5s).
+  configured_bitrate_bps_ = target_bitrate_bps_;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -633,6 +666,24 @@ bool MediaFoundationH264EncoderImpl::TryInPlaceFormatChange() {
   pending_frames_.clear();
   input_credits_ = 0;
   got_first_input_credit_ = false;
+
+  // Drain events the MFT queued BEFORE the flush: a flush cannot retract an
+  // already-queued METransformNeedInput/HaveOutput, and consuming one after
+  // the restart banks a phantom credit (-> MF_E_NOTACCEPTING) or drives
+  // ProcessOutput with no pending output (-> E_UNEXPECTED) — either of which
+  // would dump this healthy hardware session to the software fallback the
+  // moment the format change SUCCEEDED. Race-free here: the async-MFT
+  // contract forbids new events between flush and START_OF_STREAM.
+  while (true) {
+    ComPtr<IMFMediaEvent> stale;
+    HRESULT ehr = event_generator_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &stale);
+    if (ehr == MF_E_NO_EVENTS_AVAILABLE) {
+      break;
+    }
+    if (FAILED(ehr)) {
+      return false;  // queue unusable — take the full-rebuild path
+    }
+  }
 
   if (ConfigureMediaTypes(mft_friendly_name_) != WEBRTC_VIDEO_CODEC_OK) {
     RTC_LOG(LS_WARNING) << "MFT \"" << mft_friendly_name_
@@ -933,6 +984,16 @@ int32_t MediaFoundationH264EncoderImpl::DrainOneOutput() {
                                                      &new_type))) {
       transform_->SetOutputType(output_stream_id_, new_type.Get(), 0);
     }
+    if (output.pEvents) {
+      output.pEvents->Release();
+    }
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+  if (hr == E_UNEXPECTED || hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+    // A HaveOutput event with no actual pending output — a stale or
+    // contract-violating event (some vendors emit them around flushes).
+    // Benign: skip this pump iteration instead of dumping the session to
+    // the software fallback (Chromium does the same).
     if (output.pEvents) {
       output.pEvents->Release();
     }
