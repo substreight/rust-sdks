@@ -351,6 +351,25 @@ impl PeerTransport {
                         rewritten
                             .push_str(&format!(";x-google-start-bitrate={start_bitrate_kbps}"));
                     }
+                    // Bitrate FLOOR: without one, transient BWE dips collapse
+                    // the encode to ~1-3Mbps on clean links, pumping resolution
+                    // down/up (field telemetry: 2.8<->8.0Mbps sawtooth, 1080p
+                    // <->1440p flapping). Floor at 40% of the start estimate so
+                    // brief dips ride through; genuinely bad links still adapt
+                    // below it slowly via loss-based fallback.
+                    let min_bitrate_kbps = (start_bitrate_kbps * 2 / 5).max(1000);
+                    if let Some(pos) = rewritten.find("x-google-min-bitrate=") {
+                        let after = &rewritten[pos..];
+                        let end =
+                            after.find(';').map(|i| pos + i).unwrap_or_else(|| rewritten.len());
+                        rewritten.replace_range(
+                            pos..end,
+                            &format!("x-google-min-bitrate={min_bitrate_kbps}"),
+                        );
+                    } else {
+                        rewritten
+                            .push_str(&format!(";x-google-min-bitrate={min_bitrate_kbps}"));
+                    }
                     break;
                 }
             }
