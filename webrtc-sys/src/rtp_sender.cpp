@@ -239,9 +239,21 @@ void RtpSender::set_max_bitrate(uint64_t bitrate_bps) const {
     RTC_LOG(LS_WARNING) << "set_max_bitrate: sender has no encodings";
     return;
   }
-  for (auto& encoding : params.encodings) {
-    encoding.max_bitrate_bps = static_cast<int>(bitrate_bps);
+  // Cap only the TOP encoding. With simulcast, lower layers carry their own
+  // deliberately-small caps (e.g. a low-fps tile layer); overwriting every
+  // encoding with the ceiling would let a low layer absorb the budget —
+  // libwebrtc allocates lowest-encoding-first — and starve the top layer.
+  // Single-encoding senders behave exactly as before.
+  auto top = params.encodings.begin();
+  for (auto it = params.encodings.begin(); it != params.encodings.end();
+       ++it) {
+    const int64_t it_rate = it->max_bitrate_bps.value_or(-1);
+    const int64_t top_rate = top->max_bitrate_bps.value_or(-1);
+    if (it_rate >= top_rate) {
+      top = it;  // ties pick the LAST encoding (SDK orders low -> full)
+    }
   }
+  top->max_bitrate_bps = static_cast<int>(bitrate_bps);
   auto error = sender_->SetParameters(params);
   if (!error.ok()) {
     RTC_LOG(LS_WARNING) << "set_max_bitrate failed: " << error.message();
