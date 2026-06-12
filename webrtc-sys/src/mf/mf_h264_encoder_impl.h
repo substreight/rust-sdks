@@ -75,7 +75,9 @@ class MediaFoundationH264EncoderImpl : public VideoEncoder {
 
   // Enumerate hardware NV12->H264 encoder MFTs (per GPU adapter via
   // MFTEnum2 when available) and configure the first one that accepts our
-  // media types (vendors differ; iterate, don't assume).
+  // media types (vendors differ; iterate, don't assume). Reuses the cached
+  // activation from the previous session when one exists, so rebuilds
+  // (resolution changes, InitEncode re-init) skip the enumeration sweep.
   int32_t CreateAndConfigureTransform();
   // Try to fully configure one candidate MFT (activate, unlock, D3D manager,
   // CodecAPI, media types, begin streaming). `adapter_luid` is the DXGI
@@ -85,22 +87,46 @@ class MediaFoundationH264EncoderImpl : public VideoEncoder {
   int32_t TryConfigureTransform(IMFActivate* activate,
                                 const std::string& name,
                                 const LUID* adapter_luid);
+  // Apply the rate-control / latency / GOP / QP CodecAPI knobs (best
+  // effort, per-knob rejections logged). Shared between full configuration
+  // and the in-place format change, which can reset vendor rate control.
+  void ApplyCodecApiKnobs(const std::string& name);
+  // Negotiate output+input media types at codec_.width/height and refresh
+  // the negotiated input stride and output stream info. Shared between
+  // TryConfigureTransform and TryInPlaceFormatChange.
+  int32_t ConfigureMediaTypes(const std::string& name);
+  // Attempt a dynamic format change on the live MFT (end-of-stream + flush,
+  // re-set media types, start-of-stream) instead of a full pipeline
+  // rebuild. Async MFTs are spec-required to support this but vendor
+  // compliance varies; returns false on any rejection and the caller falls
+  // back to a full CreateAndConfigureTransform().
+  bool TryInPlaceFormatChange();
   // (Re)create the D3D11 device + DXGI manager on the given adapter.
   // Hardware MFTs only accept a device manager whose device lives on THEIR
   // adapter (per-adapter registration); a default-adapter device is rejected
   // with E_FAIL on every other GPU.
   bool EnsureDeviceManagerForAdapter(const LUID& adapter_luid);
+  // Tear down the current transform session (graceful end-of-stream
+  // messages when one is live) and reset all per-session pump state:
+  // credits, pending input/frames, first-credit flag. The D3D manager and
+  // the cached activation deliberately survive — see Release().
   void ResetTransformState();
   // Pump the MFT event queue. If `wait_for_input_credit` is set, blocks
   // (bounded) until the MFT grants an input credit.
   int32_t PumpEvents(bool wait_for_input_credit);
   int32_t DeliverPendingInput();
   int32_t DrainOneOutput();
-  HRESULT ApplyBitrate(uint32_t bitrate_bps);
+  // Returns true only when the new bitrate was actually applied. Vendors
+  // that refuse mid-session changes report IsModifiable S_FALSE — which
+  // passes SUCCEEDED() — so this must not be folded back into an HRESULT.
+  bool ApplyBitrate(uint32_t bitrate_bps);
   int32_t ProcessOutputSample(Microsoft::WRL::ComPtr<IMFSample> sample);
 
   const Environment& env_;
   const SdpVideoFormat format_;
+  // Negotiated SDP asks for High profile (640032-style profile-level-id).
+  // Decides MF_MT_MPEG2_PROFILE and whether CABAC is requested.
+  bool high_profile_ = false;
   EncodedImageCallback* encoded_image_callback_ = nullptr;
 
   Microsoft::WRL::ComPtr<IMFTransform> transform_;
@@ -113,6 +139,16 @@ class MediaFoundationH264EncoderImpl : public VideoEncoder {
   // Adapter the current dxgi_manager_ was created on (validity tracked by
   // dxgi_manager_ being non-null).
   LUID dxgi_manager_luid_ = {};
+  // A manager is attached to the CURRENT transform (drives the
+  // MF_E_UNSUPPORTED_D3D_TYPE detach-and-retry in ConfigureMediaTypes).
+  bool d3d_manager_attached_ = false;
+  // Activation cache: the MFT that configured successfully last session.
+  // Rebuilds re-activate it directly instead of re-running the
+  // MFTEnum2/DXGI sweep. Cleared on configuration failure or destruction.
+  Microsoft::WRL::ComPtr<IMFActivate> cached_activate_;
+  LUID cached_activate_luid_ = {};
+  bool cached_activate_has_luid_ = false;
+  std::string cached_activate_name_;
   std::string mft_friendly_name_;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
@@ -123,6 +159,10 @@ class MediaFoundationH264EncoderImpl : public VideoEncoder {
   // Cold hardware sessions can take far longer than the steady-state pump
   // deadline to grant the first input credit (QSV: seconds on first use).
   bool got_first_input_credit_ = false;
+  // Some session on this encoder instance has granted a credit before:
+  // rebuild sessions get a middle-ground first-credit deadline instead of
+  // the cold-start one (the driver stack is already warm).
+  bool any_session_warmed_ = false;
 
   // Credits granted by METransformNeedInput not yet consumed.
   int input_credits_ = 0;
@@ -136,6 +176,13 @@ class MediaFoundationH264EncoderImpl : public VideoEncoder {
   uint32_t configured_bitrate_bps_ = 0;
   uint32_t target_bitrate_bps_ = 0;
   int64_t last_bitrate_update_ms_ = 0;
+  // Rate-limits the re-init path taken when a vendor refuses mid-session
+  // bitrate changes and the target has drifted far from the configured rate.
+  int64_t last_rate_reinit_ms_ = 0;
+  // Set by SetRates when such a re-init is due; serviced by Encode(), which
+  // owns the rebuild/fallback error paths.
+  bool pending_rate_reinit_ = false;
+  bool bitrate_unmodifiable_logged_ = false;
   bool force_key_frame_ = false;
   bool sending_ = true;
 

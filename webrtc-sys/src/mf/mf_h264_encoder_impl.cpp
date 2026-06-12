@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "api/video_codecs/h264_profile_level_id.h"
 #include "common_video/h264/h264_common.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "mf_encoder_factory.h"
@@ -52,6 +53,12 @@ constexpr int kPumpDeadlineMs = 250;
 // QSV first-ever activation has been measured in seconds; AMD warmup too).
 // A tight first deadline would dump perfectly good encoders to software.
 constexpr int kFirstPumpDeadlineMs = 2500;
+// Rebuild sessions (resolution change, InitEncode re-init) run on a warm
+// driver stack but a brand-new MFT session can still take longer than the
+// steady-state deadline to grant its first credit, especially under GPU
+// contention (game streaming). Waiting ~1s is far better than dumping a
+// healthy hardware session to the OpenH264 fallback.
+constexpr int kRebuildPumpDeadlineMs = 1000;
 
 // Re-apply dynamic bitrate at most once a second; some vendor MFTs glitch
 // when CodecAPI values are hammered every SetRates() call (~30/s).
@@ -63,6 +70,15 @@ HRESULT SetCodecApiU32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   var.vt = VT_UI4;
   var.ulVal = value;
   return api->SetValue(&guid, &var);
+}
+
+// HRD/VBV size in bits: ~0.75s of the target rate. Big enough that the
+// rate controller averages across IDRs instead of starving the frames
+// after each one; small enough that an IDR burst can't add a second of
+// pacer latency. Capped for the 4K tiers.
+UINT32 HrdBufferBitsFor(uint32_t bitrate_bps) {
+  return static_cast<UINT32>(
+      std::min<uint64_t>(uint64_t{bitrate_bps} * 3 / 4, 60'000'000));
 }
 
 // RTC_LOG's stream does not understand std::hex (it prints the manipulator's
@@ -93,10 +109,24 @@ std::string GetActivateFriendlyName(IMFActivate* activate) {
 MediaFoundationH264EncoderImpl::MediaFoundationH264EncoderImpl(
     const Environment& env,
     const SdpVideoFormat& format)
-    : env_(env), format_(format) {}
+    : env_(env), format_(format) {
+  // The factory advertises both Constrained Baseline (42e01f) and High
+  // (640032); encode whichever profile this format negotiated.
+  const auto profile_level = ParseSdpForH264ProfileLevelId(format_.parameters);
+  high_profile_ =
+      profile_level &&
+      (profile_level->profile == H264Profile::kProfileHigh ||
+       profile_level->profile == H264Profile::kProfileConstrainedHigh ||
+       profile_level->profile == H264Profile::kProfilePredictiveHigh444);
+}
 
 MediaFoundationH264EncoderImpl::~MediaFoundationH264EncoderImpl() {
   Release();
+  // Release() deliberately preserves these across re-inits; the destructor
+  // is where they actually die.
+  cached_activate_.Reset();
+  dxgi_manager_.Reset();
+  d3d_device_.Reset();
 }
 
 int32_t MediaFoundationH264EncoderImpl::InitEncode(
@@ -163,6 +193,34 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
 
   if (!MediaFoundationVideoEncoderFactory::IsSupported()) {
     return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
+  // This is also the REBUILD path (mid-stream resolution changes). Tear the
+  // old session down and reset all per-session pump state first: credits or
+  // pending frames leaking from the dead transform make the fresh MFT
+  // reject its first ProcessInput (MF_E_NOTACCEPTING) and silently dump the
+  // stream to the OpenH264 fallback.
+  ResetTransformState();
+
+  // Fast path: re-activate the MFT that configured successfully last
+  // session instead of re-running the MFTEnum2/DXGI sweep. ShutdownObject
+  // first — IMFActivate caches its created object, and we want a fresh
+  // transform, not the one we just end-streamed.
+  if (cached_activate_) {
+    cached_activate_->ShutdownObject();
+    if (TryConfigureTransform(cached_activate_.Get(), cached_activate_name_,
+                              cached_activate_has_luid_
+                                  ? &cached_activate_luid_
+                                  : nullptr) == WEBRTC_VIDEO_CODEC_OK) {
+      mft_friendly_name_ = cached_activate_name_;
+      return WEBRTC_VIDEO_CODEC_OK;
+    }
+    RTC_LOG(LS_WARNING) << "MF encoder: cached MFT \"" << cached_activate_name_
+                        << "\" no longer configures; re-enumerating.";
+    ResetTransformState();
+    cached_activate_.Reset();
+    cached_activate_has_luid_ = false;
+    cached_activate_name_.clear();
   }
 
   MFT_REGISTER_TYPE_INFO input_info = {MFMediaType_Video, MFVideoFormat_NV12};
@@ -256,6 +314,11 @@ int32_t MediaFoundationH264EncoderImpl::CreateAndConfigureTransform() {
                                                  : nullptr) ==
         WEBRTC_VIDEO_CODEC_OK) {
       mft_friendly_name_ = name;
+      // Remember the winner so rebuilds skip the enumeration sweep.
+      cached_activate_ = candidate.activate;
+      cached_activate_luid_ = candidate.luid;
+      cached_activate_has_luid_ = candidate.has_luid;
+      cached_activate_name_ = name;
       result = WEBRTC_VIDEO_CODEC_OK;
       break;
     }
@@ -352,14 +415,13 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
   // Attach a DXGI device manager BEFORE negotiating media types — but ONLY
   // one whose device lives on the MFT's own adapter (cross-adapter managers
   // are rejected with E_FAIL), and only to MFTs declaring D3D11 awareness.
-  bool manager_attached = false;
   if (d3d_aware && adapter_luid &&
       EnsureDeviceManagerForAdapter(*adapter_luid)) {
     HRESULT mhr = transform_->ProcessMessage(
         MFT_MESSAGE_SET_D3D_MANAGER,
         reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get()));
     if (SUCCEEDED(mhr)) {
-      manager_attached = true;
+      d3d_manager_attached_ = true;
       RTC_LOG(LS_INFO) << "MFT \"" << name
                        << "\": adapter-matched DXGI device manager attached";
     } else {
@@ -389,35 +451,75 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     output_stream_id_ = 0;
   }
 
-  // Rate control + latency knobs (best effort; vendors vary). Every
-  // rejection is logged: a silently-ignored knob (B-frames, VBR) is the
-  // difference between smooth and weird on some driver stacks.
-  if (SUCCEEDED(transform_.As(&codec_api_)) && codec_api_) {
-    auto set_knob = [&](const GUID& guid, UINT32 value, const char* knob) {
-      HRESULT rc = SetCodecApiU32(codec_api_.Get(), guid, value);
-      if (FAILED(rc)) {
-        RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected " << knob
-                            << " (hr=" << HexHr(rc) << ")";
-      }
-    };
-    set_knob(CODECAPI_AVEncCommonRateControlMode,
-             eAVEncCommonRateControlMode_CBR, "CBR rate control");
-    set_knob(CODECAPI_AVEncCommonMeanBitRate, target_bitrate_bps_,
-             "mean bitrate");
-    set_knob(CODECAPI_AVLowLatencyMode, TRUE, "low-latency mode");
-    set_knob(CODECAPI_AVEncMPVDefaultBPictureCount, 0, "B-frame disable");
-    // Long GOP; recovery uses PLI-driven forced IDRs rather than periodic
-    // keyframes (matches the NVENC impl's infinite-GOP approach).
-    set_knob(CODECAPI_AVEncMPVGOPSize, codec_.maxFramerate * 10, "GOP size");
-    configured_bitrate_bps_ = target_bitrate_bps_;
-  } else {
+  // Rate control + latency knobs (best effort; vendors vary).
+  if (FAILED(transform_.As(&codec_api_)) || !codec_api_) {
+    codec_api_.Reset();
     RTC_LOG(LS_WARNING) << "MFT \"" << name
                         << "\": no ICodecAPI; using type defaults.";
   }
+  ApplyCodecApiKnobs(name);
 
+  int32_t types_ret = ConfigureMediaTypes(name);
+  if (types_ret != WEBRTC_VIDEO_CODEC_OK) {
+    return types_ret;
+  }
+
+  hr = transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": NOTIFY_BEGIN_STREAMING "
+                           "failed (hr=" << HexHr(hr) << ")";
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MediaFoundationH264EncoderImpl::ApplyCodecApiKnobs(
+    const std::string& name) {
+  if (!codec_api_) {
+    return;
+  }
+  // Every rejection is logged: a silently-ignored knob (B-frames, VBR) is
+  // the difference between smooth and weird on some driver stacks.
+  auto set_knob = [&](const GUID& guid, UINT32 value, const char* knob) {
+    HRESULT rc = SetCodecApiU32(codec_api_.Get(), guid, value);
+    if (FAILED(rc)) {
+      RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": rejected " << knob
+                          << " (hr=" << HexHr(rc) << ")";
+    }
+  };
+  set_knob(CODECAPI_AVEncCommonRateControlMode,
+           eAVEncCommonRateControlMode_CBR, "CBR rate control");
+  set_knob(CODECAPI_AVEncCommonMeanBitRate, target_bitrate_bps_,
+           "mean bitrate");
+  // Without an HRD/VBV buffer the encoder budgets frame-by-frame, so every
+  // IDR starves the frames after it (periodic blur pulse) and the pacer
+  // bursts. ~0.75s of target averages rate across the keyframe.
+  set_knob(CODECAPI_AVEncCommonBufferSize,
+           HrdBufferBitsFor(target_bitrate_bps_), "HRD buffer size");
+  set_knob(CODECAPI_AVLowLatencyMode, TRUE, "low-latency mode");
+  set_knob(CODECAPI_AVEncMPVDefaultBPictureCount, 0, "B-frame disable");
+  // Keyframes ~1/min: steady-state recovery is PLI-driven (the SFU
+  // throttles PLIs), and a periodic IDR inside a CBR budget is a
+  // metronomic quality dip. 10s GOPs were the old behavior and visibly
+  // pulsed; Discord ships ~1/min for the same reason.
+  set_knob(CODECAPI_AVEncMPVGOPSize, codec_.maxFramerate * 60, "GOP size");
+  // Hard floor under perceptual quality: prefer briefly dropping frames
+  // over QP mud when the budget is exceeded.
+  set_knob(CODECAPI_AVEncVideoMaxQP, 40, "max QP");
+  if (high_profile_) {
+    // High alone doesn't guarantee CABAC on all vendors; ask explicitly.
+    set_knob(CODECAPI_AVEncH264CABACEnable, TRUE, "CABAC");
+  }
+  configured_bitrate_bps_ = target_bitrate_bps_;
+}
+
+int32_t MediaFoundationH264EncoderImpl::ConfigureMediaTypes(
+    const std::string& name) {
   // Output type FIRST (encoder MFTs negotiate input against output).
   ComPtr<IMFMediaType> output_type;
-  hr = MFCreateMediaType(&output_type);
+  HRESULT hr = MFCreateMediaType(&output_type);
   if (FAILED(hr)) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -430,11 +532,15 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
                       1);
   MFSetAttributeRatio(output_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
   output_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-  // Constrained-ish Baseline: matches the advertised 42e01f and the
-  // profile rtc_session prefers. B frames are disabled via CodecAPI.
-  output_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+  // Profile follows the negotiated SDP format: High (640032, CABAC/8x8 —
+  // ~10% better text/UI quality at the same bitrate) when offered and
+  // accepted, Constrained-ish Baseline (42e01f) otherwise. B frames are
+  // disabled via CodecAPI either way.
+  output_type->SetUINT32(MF_MT_MPEG2_PROFILE, high_profile_
+                                                  ? eAVEncH264VProfile_High
+                                                  : eAVEncH264VProfile_Base);
   hr = transform_->SetOutputType(output_stream_id_, output_type.Get(), 0);
-  if (hr == MF_E_UNSUPPORTED_D3D_TYPE && manager_attached) {
+  if (hr == MF_E_UNSUPPORTED_D3D_TYPE && d3d_manager_attached_) {
     // Documented contract for D3D-aware MFTs: on MF_E_UNSUPPORTED_D3D_TYPE,
     // detach the manager (SET_D3D_MANAGER with NULL) so the MFT reverts to
     // system-memory intake, then retry. Leaving a half-set manager in place
@@ -442,7 +548,7 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": D3D type rejected; "
                            "reverting to system-memory mode and retrying";
     transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-    manager_attached = false;
+    d3d_manager_attached_ = false;
     hr = transform_->SetOutputType(output_stream_id_, output_type.Get(), 0);
   }
   if (FAILED(hr)) {
@@ -508,23 +614,59 @@ int32_t MediaFoundationH264EncoderImpl::TryConfigureTransform(
     output_buffer_size_ =
         static_cast<DWORD>(codec_.width) * codec_.height * 2;
   }
-
-  hr = transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-  if (FAILED(hr)) {
-    RTC_LOG(LS_WARNING) << "MFT \"" << name << "\": NOTIFY_BEGIN_STREAMING "
-                           "failed (hr=" << HexHr(hr) << ")";
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-  transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void MediaFoundationH264EncoderImpl::ResetTransformState() {
+bool MediaFoundationH264EncoderImpl::TryInPlaceFormatChange() {
+  if (!transform_ || !event_generator_) {
+    return false;
+  }
+  // Discard in-flight work — its outputs die with the old format. After a
+  // flush an async MFT issues no METransformNeedInput until it sees
+  // NOTIFY_START_OF_STREAM, so all pump state resets below.
+  transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+  HRESULT hr = transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+  if (FAILED(hr)) {
+    return false;
+  }
   pending_input_.Reset();
+  pending_frames_.clear();
+  input_credits_ = 0;
+  got_first_input_credit_ = false;
+
+  if (ConfigureMediaTypes(mft_friendly_name_) != WEBRTC_VIDEO_CODEC_OK) {
+    RTC_LOG(LS_WARNING) << "MFT \"" << mft_friendly_name_
+                        << "\": in-place format change rejected; "
+                           "falling back to a full rebuild";
+    return false;
+  }
+  // Media-type churn resets rate control on some vendors; re-assert.
+  ApplyCodecApiKnobs(mft_friendly_name_);
+
+  hr = transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+  if (FAILED(hr)) {
+    return false;
+  }
+  RTC_LOG(LS_INFO) << "MFT \"" << mft_friendly_name_
+                   << "\": in-place format change to " << codec_.width << "x"
+                   << codec_.height;
+  return true;
+}
+
+void MediaFoundationH264EncoderImpl::ResetTransformState() {
+  if (transform_) {
+    // Graceful teardown of the live session before dropping our reference;
+    // hardware sessions otherwise linger until the MFT object finalizes.
+    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+  }
+  pending_input_.Reset();
+  pending_frames_.clear();
   codec_api_.Reset();
   event_generator_.Reset();
   transform_.Reset();
+  d3d_manager_attached_ = false;
   input_stream_id_ = 0;
   output_stream_id_ = 0;
   output_provides_samples_ = true;
@@ -532,8 +674,9 @@ void MediaFoundationH264EncoderImpl::ResetTransformState() {
   input_credits_ = 0;
   input_stride_ = 0;
   got_first_input_credit_ = false;
-  // dxgi_manager_/d3d_device_ are deliberately kept: they're keyed by
-  // adapter LUID and reusable across candidates on the same adapter.
+  // dxgi_manager_/d3d_device_/cached_activate_ are deliberately kept:
+  // they're keyed by adapter LUID and reusable across candidates and
+  // across rebuilds on the same adapter.
 }
 
 int32_t MediaFoundationH264EncoderImpl::RegisterEncodeCompleteCallback(
@@ -543,19 +686,12 @@ int32_t MediaFoundationH264EncoderImpl::RegisterEncodeCompleteCallback(
 }
 
 int32_t MediaFoundationH264EncoderImpl::Release() {
-  if (transform_) {
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-  }
-  pending_input_.Reset();
-  codec_api_.Reset();
-  event_generator_.Reset();
-  transform_.Reset();
-  dxgi_manager_.Reset();
-  d3d_device_.Reset();
-  pending_frames_.clear();
-  input_credits_ = 0;
+  ResetTransformState();
+  // The D3D device manager and the cached MFT activation deliberately
+  // SURVIVE Release(): libwebrtc re-inits the encoder through
+  // InitEncode→Release on every reconfigure (the dominant rebuild path),
+  // and recreating the device + re-enumerating MFTs there is what made
+  // every resolution step a long freeze. Both die in the destructor.
   initialized_ = false;
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -589,19 +725,38 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
 
   if (frame_buffer->width() != codec_.width ||
       frame_buffer->height() != codec_.height) {
-    // Resolution changed under us: re-init at the new size (libwebrtc also
-    // drives this via InitEncode in most paths; this covers the rest).
+    // Resolution changed under us (libwebrtc also drives this via
+    // InitEncode in most paths; this covers the rest). Prefer a dynamic
+    // format change on the live MFT — a full pipeline rebuild is a visible
+    // freeze and is exactly what made BWE-driven resolution steps hitch.
     RTC_LOG(LS_INFO) << "MF encoder resolution change "
                      << codec_.width << "x" << codec_.height << " -> "
                      << frame_buffer->width() << "x" << frame_buffer->height();
     codec_.width = static_cast<uint16_t>(frame_buffer->width());
     codec_.height = static_cast<uint16_t>(frame_buffer->height());
-    int32_t ret = CreateAndConfigureTransform();
-    if (ret != WEBRTC_VIDEO_CODEC_OK) {
-      Release();
-      return ret;
+    if (!TryInPlaceFormatChange()) {
+      int32_t ret = CreateAndConfigureTransform();
+      if (ret != WEBRTC_VIDEO_CODEC_OK) {
+        Release();
+        return ret;
+      }
     }
+    pending_rate_reinit_ = false;
     force_key_frame_ = true;
+  }
+
+  if (pending_rate_reinit_) {
+    // A vendor that refuses dynamic bitrate updates drifted >=30% from the
+    // target (see SetRates). The in-place path re-sets MF_MT_AVG_BITRATE
+    // and the CodecAPI knobs without tearing the session down.
+    pending_rate_reinit_ = false;
+    if (TryInPlaceFormatChange() ||
+        CreateAndConfigureTransform() == WEBRTC_VIDEO_CODEC_OK) {
+      force_key_frame_ = true;
+    } else {
+      Release();
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    }
   }
 
   bool send_key_frame =
@@ -677,8 +832,10 @@ int32_t MediaFoundationH264EncoderImpl::Encode(
 int32_t MediaFoundationH264EncoderImpl::PumpEvents(
     bool wait_for_input_credit) {
   const int64_t deadline_ms =
-      TimeMillis() +
-      (got_first_input_credit_ ? kPumpDeadlineMs : kFirstPumpDeadlineMs);
+      TimeMillis() + (got_first_input_credit_
+                          ? kPumpDeadlineMs
+                          : (any_session_warmed_ ? kRebuildPumpDeadlineMs
+                                                 : kFirstPumpDeadlineMs));
 
   while (true) {
     if (pending_input_ && input_credits_ > 0) {
@@ -713,6 +870,7 @@ int32_t MediaFoundationH264EncoderImpl::PumpEvents(
     switch (type) {
       case METransformNeedInput:
         got_first_input_credit_ = true;
+        any_session_warmed_ = true;
         input_credits_++;
         break;
       case METransformHaveOutput: {
@@ -883,18 +1041,35 @@ int32_t MediaFoundationH264EncoderImpl::ProcessOutputSample(
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-HRESULT MediaFoundationH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
+bool MediaFoundationH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
   if (!codec_api_) {
-    return E_NOINTERFACE;
+    return false;
   }
-  VARIANT modifiable;
-  VariantInit(&modifiable);
+  // IsModifiable returns S_FALSE — which passes SUCCEEDED()! — when the
+  // vendor refuses mid-session changes (seen on Intel MFTs). Treating that
+  // as success used to latch configured_bitrate_bps_ without applying
+  // anything, so the encoder ran at a stale rate forever, silently.
   HRESULT hr = codec_api_->IsModifiable(&CODECAPI_AVEncCommonMeanBitRate);
-  if (hr == S_FALSE) {
-    return S_FALSE;
+  if (hr != S_OK) {
+    if (!bitrate_unmodifiable_logged_) {
+      bitrate_unmodifiable_logged_ = true;
+      RTC_LOG(LS_WARNING) << "MFT \"" << mft_friendly_name_
+                          << "\": mid-session bitrate changes not supported "
+                             "(IsModifiable hr="
+                          << HexHr(hr)
+                          << "); large rate changes will re-init the session";
+    }
+    return false;
   }
-  return SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                        bitrate_bps);
+  if (FAILED(SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
+                            bitrate_bps))) {
+    return false;
+  }
+  // Keep the HRD window proportional to the new target (best effort; some
+  // vendors lock it once streaming).
+  SetCodecApiU32(codec_api_.Get(), CODECAPI_AVEncCommonBufferSize,
+                 HrdBufferBitsFor(bitrate_bps));
+  return true;
 }
 
 void MediaFoundationH264EncoderImpl::SetRates(
@@ -922,8 +1097,30 @@ void MediaFoundationH264EncoderImpl::SetRates(
   const int64_t now_ms = TimeMillis();
   if (target_bitrate_bps_ != configured_bitrate_bps_ &&
       now_ms - last_bitrate_update_ms_ >= kBitrateUpdateIntervalMs) {
-    if (SUCCEEDED(ApplyBitrate(target_bitrate_bps_))) {
+    if (ApplyBitrate(target_bitrate_bps_)) {
       configured_bitrate_bps_ = target_bitrate_bps_;
+    } else {
+      // Vendor refused the dynamic change. Small drift is tolerable; past
+      // ~30% the stream is either overshooting a congested link or stuck
+      // soft on a recovered one, so re-init the session at the new rate.
+      // Rate-limited: a rebuild is itself a hitch.
+      const uint64_t reference = std::max(configured_bitrate_bps_, 1u);
+      const uint64_t delta =
+          target_bitrate_bps_ > configured_bitrate_bps_
+              ? target_bitrate_bps_ - configured_bitrate_bps_
+              : configured_bitrate_bps_ - target_bitrate_bps_;
+      if (delta * 100 / reference >= 30 &&
+          now_ms - last_rate_reinit_ms_ >= 5000) {
+        last_rate_reinit_ms_ = now_ms;
+        RTC_LOG(LS_WARNING)
+            << "MF encoder will re-init for bitrate change "
+            << configured_bitrate_bps_ << " -> " << target_bitrate_bps_
+            << " bps (vendor refuses dynamic updates)";
+        // Handled on the next Encode(), which owns the rebuild/fallback
+        // error paths; a failed rebuild here would strand a dead transform
+        // behind initialized_=true.
+        pending_rate_reinit_ = true;
+      }
     }
     last_bitrate_update_ms_ = now_ms;
   }

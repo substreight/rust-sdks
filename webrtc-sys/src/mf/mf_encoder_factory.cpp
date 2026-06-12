@@ -110,8 +110,19 @@ bool ProbeHardwareH264Mft() {
 }  // namespace
 
 MediaFoundationVideoEncoderFactory::MediaFoundationVideoEncoderFactory() {
-  // Same H264 flavor the SDK's sender path prefers (constrained baseline,
-  // packetization-mode 1) and that the NVENC factory advertises.
+  // High profile first: CABAC + 8x8 transforms are ~10% better text/UI
+  // quality at the same bitrate, every hardware MFT we target supports it,
+  // and 640032 is the exact High fmtp LiveKit's SFU registers (the SFU
+  // strips High from SUBSCRIBER offers but forwards the bitstream over the
+  // baseline-signaled PT, so no viewer-side work is needed).
+  std::map<std::string, std::string> high_parameters = {
+      {"profile-level-id", "640032"},
+      {"level-asymmetry-allowed", "1"},
+      {"packetization-mode", "1"},
+  };
+  supported_formats_.push_back(SdpVideoFormat("H264", high_parameters));
+  // Constrained baseline fallback: same flavor the SDK's sender path
+  // historically preferred and that the NVENC factory advertises.
   std::map<std::string, std::string> baseline_parameters = {
       {"profile-level-id", "42e01f"},
       {"level-asymmetry-allowed", "1"},
