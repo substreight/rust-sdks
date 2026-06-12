@@ -1782,6 +1782,7 @@ impl SessionInner {
                 },
             );
 
+            let mut high_matched = Vec::new();
             let mut matched = Vec::new();
             let mut partial_matched = Vec::new();
             let mut unmatched = Vec::new();
@@ -1790,8 +1791,15 @@ impl SessionInner {
                 let mime_type = codec.mime_type.to_lowercase();
                 if mime_type == format!("video/{}", options.video_codec.as_str()) {
                     if let Some(sdp_fmtp_line) = codec.sdp_fmtp_line.as_ref() {
-                        // for h264 codecs that have sdpFmtpLine available, use only if the
-                        // profile-level-id is 42e01f for cross-browser compatibility
+                        // H264 ranking: High profile first (640032 — the exact
+                        // fmtp LiveKit's SFU registers for High; CABAC/8x8 is
+                        // ~10% better text/UI quality at equal bitrate), then
+                        // constrained baseline 42e01f as the cross-browser
+                        // negotiation fallback.
+                        if sdp_fmtp_line.contains("profile-level-id=640032") {
+                            high_matched.push(codec);
+                            continue;
+                        }
                         if sdp_fmtp_line.contains("profile-level-id=42e01f") {
                             matched.push(codec);
                             continue;
@@ -1803,9 +1811,10 @@ impl SessionInner {
                 }
             }
 
-            matched.append(&mut partial_matched);
+            high_matched.append(&mut matched);
+            high_matched.append(&mut partial_matched);
 
-            transceiver.set_codec_preferences(matched)?;
+            transceiver.set_codec_preferences(high_matched)?;
         }
 
         Ok(transceiver)
